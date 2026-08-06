@@ -1,0 +1,31 @@
+# systemd *user* service for the Cassandra fleet client.
+#
+# Copy to ~/.config/systemd/user/cassandra-client.service
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now cassandra-client
+#   loginctl enable-linger $USER      # keep running when logged out
+#
+# User-level on purpose: Bazzite is immutable, and nothing here needs
+# rpm-ostree, root, or any system path.
+#
+# Restart=always is load-bearing: the client updates itself by checking out a
+# new commit and *exiting*, and this is what brings it back on the new code.
+# It is also what makes rollback work — a broken version exits, systemd
+# restarts it, and after three failed heartbeats the previous checkout is
+# restored.
+
+[Unit]
+Description=Cassandra fleet client
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.cassandra/client/cassandra_client.py watch
+Restart=always
+# Long enough that a crash loop does not hammer the server, short enough that a
+# rollback completes in a couple of minutes.
+RestartSec=30
+
+[Install]
+WantedBy=default.target

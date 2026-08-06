@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS agent for the Cassandra fleet client.
+
+  Copy to ~/Library/LaunchAgents/com.cassandra.client.plist and replace USERNAME.
+
+  KeepAlive is load-bearing: the client updates itself by checking out a new
+  commit and *exiting*, and this is what brings it back on the new code. It is
+  also what makes rollback work — a broken version exits, launchd restarts it,
+  and after three failed heartbeats it puts the previous checkout back.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cassandra.client</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/USERNAME/.cassandra/client/cassandra_client.py</string>
+    <string>watch</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Do not hammer the server if something is badly wrong. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/USERNAME/.cassandra/client.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USERNAME/.cassandra/client.log</string>
+</dict>
+</plist>
