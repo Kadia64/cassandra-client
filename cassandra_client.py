@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 DEFAULT_INTERVAL = 300
 TIMEOUT = 60
