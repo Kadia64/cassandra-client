@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 DEFAULT_INTERVAL = 300
 TIMEOUT = 60
@@ -332,7 +332,8 @@ def try_heartbeat(cfg: dict) -> dict | None:
     watchdog needs, so a failure here is data, not a crash.
     """
     try:
-        return post(cfg, "/api/fleet/heartbeat", {"current_sha": current_sha()})
+        return post(cfg, "/api/fleet/heartbeat",
+                    {"current_sha": current_sha(), "client_version": VERSION})
     except SystemExit as exc:
         print(f"heartbeat failed: {exc}")
         return None
