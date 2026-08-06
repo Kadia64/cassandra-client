@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 DEFAULT_INTERVAL = 300
 TIMEOUT = 60
@@ -406,6 +406,17 @@ def cmd_status(args) -> None:
 
 
 def main() -> None:
+    # Under launchd or systemd, stdout is a file rather than a terminal, and
+    # Python block-buffers it. A process that prints and then sleeps for five
+    # minutes therefore writes nothing at all — launchd does not even create the
+    # log file, which reads as "the service never started". Line buffering makes
+    # the log a live view of what the client is doing.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except AttributeError:      # pragma: no cover — Python < 3.7
+            pass
+
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
 

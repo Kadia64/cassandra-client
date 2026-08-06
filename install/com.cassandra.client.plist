@@ -23,6 +23,13 @@
     <string>watch</string>
   </array>
 
+  <!-- Python block-buffers stdout when it is a file; without this a fresh
+       install looks dead because the log is never created. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
