@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.3"
+VERSION = "0.3.0"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 DEFAULT_INTERVAL = 300
 TIMEOUT = 60
@@ -105,7 +105,23 @@ def read_cwd(data: bytes, dirname: str) -> str:
     return decode_cwd(dirname)
 
 
-def local_sessions(root: Path) -> list[dict]:
+def is_excluded(cwd: str, exclude: list[str]) -> bool:
+    """Directories the server has said not to sync.
+
+    Not every Claude session is project work — fixing the printer, a one-off
+    script. Those are noise at best, and at worst something you would rather
+    was never uploaded. The list comes down the heartbeat, so changing it is one
+    call rather than an edit on every machine.
+    """
+    for base in exclude or []:
+        base = str(base).rstrip("/\\")
+        if base and (cwd == base or cwd.startswith(base + "/")
+                     or cwd.startswith(base + "\\")):
+            return True
+    return False
+
+
+def local_sessions(root: Path, exclude: list[str] | None = None) -> list[dict]:
     """Every transcript on this machine, with its hash."""
     out = []
     if not root.is_dir():
@@ -118,10 +134,13 @@ def local_sessions(root: Path) -> list[dict]:
                 data = path.read_bytes()
             except OSError:
                 continue
+            cwd = read_cwd(data, folder.name)
+            if is_excluded(cwd, exclude or []):
+                continue
             out.append({
                 "session_id": path.stem,
                 "hash": hashlib.sha256(data).hexdigest(),
-                "cwd": read_cwd(data, folder.name),
+                "cwd": cwd,
                 "dirname": folder.name,
                 "bytes": len(data),
                 "path": str(path),
@@ -302,7 +321,7 @@ def cmd_sync(args) -> int:
         raise SystemExit(f"not registered — run `register` first ({CONFIG} has no token)")
 
     root = transcript_root(sys.platform, Path.home())
-    sessions = local_sessions(root)
+    sessions = local_sessions(root, exclude)
     if not sessions:
         print(f"no transcripts under {root}")
         return 0
@@ -389,7 +408,7 @@ def cmd_watch(args) -> None:
                 return                      # ditto, on the new code
 
             try:
-                cmd_sync(args)
+                cmd_sync(args, beat.get("config", {}).get("exclude"))
             except SystemExit as exc:       # a transient outage must not end the watch
                 print(f"sync failed: {exc}")
             except Exception as exc:        # noqa: BLE001 — same reasoning

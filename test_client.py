@@ -135,3 +135,28 @@ def test_a_corrupt_config_reads_as_empty(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(client, "CONFIG", tmp_path / "client.json")
     client.CONFIG.write_text("{ not json")
     assert client.load_config() == {}
+
+
+# ---- exclusions ------------------------------------------------------------
+
+def test_excluded_directories_are_skipped(tmp_path: Path) -> None:
+    """Sessions that are computer tasks rather than project work never leave
+    the machine at all."""
+    for name, cwd in [("-a-work", "/a/work"), ("-a-scratch", "/a/scratch")]:
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "s.jsonl").write_bytes(json.dumps({"cwd": cwd}).encode() + b"\n")
+
+    assert len(client.local_sessions(tmp_path)) == 2
+    kept = client.local_sessions(tmp_path, exclude=["/a/scratch"])
+    assert [s["cwd"] for s in kept] == ["/a/work"]
+
+
+def test_exclusion_covers_subdirectories() -> None:
+    assert client.is_excluded("/a/scratch/deep", ["/a/scratch"])
+    assert not client.is_excluded("/a/scratch-other", ["/a/scratch"])
+
+
+def test_no_exclusions_excludes_nothing() -> None:
+    assert not client.is_excluded("/anything", [])
+    assert not client.is_excluded("/anything", None)
