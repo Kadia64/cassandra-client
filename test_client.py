@@ -160,3 +160,71 @@ def test_exclusion_covers_subdirectories() -> None:
 def test_no_exclusions_excludes_nothing() -> None:
     assert not client.is_excluded("/anything", [])
     assert not client.is_excluded("/anything", None)
+
+
+# ---- the sync command ------------------------------------------------------
+# cmd_sync had no test, which is how a call site got an argument its signature
+# did not accept and reached a real machine as a NameError.
+
+def _stub_server(monkeypatch, tmp_path, want, calls):
+    monkeypatch.setattr(client, "CONFIG", tmp_path / "client.json")
+    client.save_config({"server": "http://x", "token": "t", "machine_id": "m"})
+    monkeypatch.setattr(client, "transcript_root",
+                        lambda system, home: tmp_path / "projects")
+
+    def fake_post(cfg, path, body, **kw):
+        calls.append((path, body))
+        if path.endswith("/heartbeat"):
+            return {"want_sha": "main", "config": {"exclude": ["/a/scratch"]}}
+        if path.endswith("/check"):
+            return {"want": want}
+        return {"project": "p"}
+
+    monkeypatch.setattr(client, "post", fake_post)
+
+
+def _make_transcript(tmp_path, name, cwd, session_id) -> None:
+    folder = tmp_path / "projects" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{session_id}.jsonl").write_bytes(
+        json.dumps({"cwd": cwd}).encode() + b"\n")
+
+
+def test_sync_uploads_what_the_server_wants(tmp_path, monkeypatch) -> None:
+    calls: list = []
+    _make_transcript(tmp_path, "-a-work", "/a/work", "aaaa-1111")
+    _stub_server(monkeypatch, tmp_path, ["aaaa-1111"], calls)
+
+    assert client.cmd_sync(object()) == 1
+    assert any(p.endswith("/upload") for p, _ in calls)
+
+
+def test_sync_skips_what_the_server_already_has(tmp_path, monkeypatch) -> None:
+    calls: list = []
+    _make_transcript(tmp_path, "-a-work", "/a/work", "aaaa-1111")
+    _stub_server(monkeypatch, tmp_path, [], calls)
+
+    assert client.cmd_sync(object()) == 0
+    assert not any(p.endswith("/upload") for p, _ in calls)
+
+
+def test_a_bare_sync_fetches_the_exclusion_list_itself(tmp_path, monkeypatch) -> None:
+    """`watch` passes exclusions in from its heartbeat; a bare `sync` has not
+    spoken to the server yet and must not upload excluded directories."""
+    calls: list = []
+    _make_transcript(tmp_path, "-a-scratch", "/a/scratch", "aaaa-1111")
+    _stub_server(monkeypatch, tmp_path, ["aaaa-1111"], calls)
+
+    client.cmd_sync(object())
+    assert any(p.endswith("/heartbeat") for p, _ in calls), "did not ask for exclusions"
+    assert not any(p.endswith("/upload") for p, _ in calls), "uploaded an excluded directory"
+
+
+def test_watch_passes_its_own_exclusions_through(tmp_path, monkeypatch) -> None:
+    calls: list = []
+    _make_transcript(tmp_path, "-a-work", "/a/work", "aaaa-1111")
+    _stub_server(monkeypatch, tmp_path, ["aaaa-1111"], calls)
+
+    client.cmd_sync(object(), exclude=["/a/work"])
+    assert not any(p.endswith("/heartbeat") for p, _ in calls), "asked twice"
+    assert not any(p.endswith("/upload") for p, _ in calls)

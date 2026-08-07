@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 DEFAULT_INTERVAL = 300
 TIMEOUT = 60
@@ -315,10 +315,17 @@ def cmd_register(args) -> None:
     print(f"registered as {machine_id}; token saved to {CONFIG}")
 
 
-def cmd_sync(args) -> int:
+def cmd_sync(args, exclude: list[str] | None = None) -> int:
+    """One pass. `exclude` comes from the heartbeat when `watch` calls this;
+    a bare `sync` has not spoken to the server yet, so it fetches the list
+    itself rather than uploading directories the operator has excluded."""
     cfg = load_config()
     if not cfg.get("token"):
         raise SystemExit(f"not registered — run `register` first ({CONFIG} has no token)")
+
+    if exclude is None:
+        beat = try_heartbeat(cfg)
+        exclude = (beat or {}).get("config", {}).get("exclude") or []
 
     root = transcript_root(sys.platform, Path.home())
     sessions = local_sessions(root, exclude)
@@ -500,10 +507,10 @@ def cmd_status(args) -> None:
     print(f"server      {cfg.get('server', '-')}")
     print(f"machine id  {cfg.get('machine_id', '-')}")
     print(f"transcripts {len(sessions)} under {root}")
-    for s in sessions[:10]:
+    for s in sessions[:40]:
         print(f"  {s['session_id'][:8]}…  {s['bytes']:>9,}B  {s['cwd']}")
-    if len(sessions) > 10:
-        print(f"  … and {len(sessions) - 10} more")
+    if len(sessions) > 40:
+        print(f"  … and {len(sessions) - 40} more")
 
 
 def main() -> None:
