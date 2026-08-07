@@ -149,22 +149,35 @@ def save_config(cfg: dict) -> None:
 
 # ---- transport --------------------------------------------------------------
 
-def post(cfg: dict, path: str, body: dict, *, auth: bool = True) -> dict:
+def request(cfg: dict, method: str, path: str, body: dict | None = None,
+            *, auth: bool = True) -> dict:
     url = cfg["server"].rstrip("/") + path
     headers = {"Content-Type": "application/json"}
     if auth:
         headers["Authorization"] = f"Bearer {cfg['token']}"
         headers["X-Machine-Id"] = cfg["machine_id"]
-    request = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
         raise SystemExit(f"{path} failed: HTTP {exc.code} {detail}") from exc
     except urllib.error.URLError as exc:
         raise SystemExit(f"{path} failed: cannot reach {url} ({exc.reason})") from exc
+
+
+def post(cfg: dict, path: str, body: dict, *, auth: bool = True) -> dict:
+    return request(cfg, "POST", path, body, auth=auth)
+
+
+def get(cfg: dict, path: str) -> dict:
+    return request(cfg, "GET", path)
+
+
+def put(cfg: dict, path: str, body: dict) -> dict:
+    return request(cfg, "PUT", path, body)
 
 
 # ---- self-update ------------------------------------------------------------
@@ -384,6 +397,74 @@ def cmd_watch(args) -> None:
         time.sleep(interval)
 
 
+# ---- projects ---------------------------------------------------------------
+# Creating a project from the machine you are working on, rather than from the
+# panel. The client already knows its machine id and can read the working
+# directory, so it fills in the transcript mapping itself — which is the one
+# thing a web form cannot do well, since it would mean typing a path you are not
+# standing in, for a machine you are not on.
+
+def require_registered() -> dict:
+    cfg = load_config()
+    if not cfg.get("token"):
+        raise SystemExit("not registered — run `register` first")
+    return cfg
+
+
+def cmd_project_list(args) -> None:
+    cfg = require_registered()
+    projects = get(cfg, "/api/projects").get("projects", [])
+    if not projects:
+        print("no projects yet")
+        return
+    here = os.getcwd()
+    for p in projects:
+        mine = any(s.get("machine_id") == cfg["machine_id"]
+                   and here.startswith(s.get("cwd", "\0"))
+                   for s in p.get("transcript_sources") or [])
+        print(f"{'*' if mine else ' '} {p['slug']:24} {p['status']:8} {p['name']}")
+    if any(p for p in projects):
+        print("\n* = this directory feeds that project")
+
+
+def _link(cfg: dict, slug: str, cwd: str) -> None:
+    """Add this machine and directory to a project's transcript sources."""
+    project = get(cfg, f"/api/projects/{slug}")
+    sources = project.get("transcript_sources") or []
+    if any(s.get("machine_id") == cfg["machine_id"] and s.get("cwd") == cwd
+           for s in sources):
+        print(f"{slug} already covers {cwd}")
+        return
+    sources.append({"machine_id": cfg["machine_id"], "cwd": cwd})
+    put(cfg, f"/api/projects/{slug}", {"transcript_sources": sources})
+    print(f"{slug} ← {cwd} ({cfg['machine_id']})")
+
+
+def cmd_project_create(args) -> None:
+    cfg = require_registered()
+    cwd = os.getcwd()
+    project = post(cfg, "/api/projects", {"name": args.name})
+    slug = project["slug"]
+    print(f"created {slug}")
+
+    if not args.no_link:
+        _link(cfg, slug, cwd)
+        # Sessions already run in this directory are sitting in the inbox with
+        # nowhere to go. Creating the project is exactly the moment they should
+        # be claimed, so the mapping applies backwards as well as forwards.
+        moved = post(cfg, "/api/fleet/reroute", {}).get("moved", 0)
+        if moved:
+            print(f"claimed {moved} transcript(s) already uploaded from here")
+
+
+def cmd_project_link(args) -> None:
+    cfg = require_registered()
+    _link(cfg, args.slug, os.getcwd())
+    moved = post(cfg, "/api/fleet/reroute", {}).get("moved", 0)
+    if moved:
+        print(f"claimed {moved} transcript(s)")
+
+
 def cmd_status(args) -> None:
     cfg = load_config()
     root = transcript_root(sys.platform, Path.home())
@@ -436,6 +517,24 @@ def main() -> None:
 
     p = sub.add_parser("update", help="move to the version the server pins")
     p.set_defaults(func=cmd_update)
+
+    # `project` — create or link a project from the directory you are in, which
+    # is where a project actually starts.
+    projects = sub.add_parser("project", help="create or link a project from here")
+    psub = projects.add_subparsers(dest="project_command", required=True)
+
+    q = psub.add_parser("create", help="create a project and feed it this directory")
+    q.add_argument("name")
+    q.add_argument("--no-link", action="store_true",
+                   help="do not map this directory to it")
+    q.set_defaults(func=cmd_project_create)
+
+    q = psub.add_parser("link", help="feed this directory to an existing project")
+    q.add_argument("slug")
+    q.set_defaults(func=cmd_project_link)
+
+    q = psub.add_parser("list", help="projects, marking the one this directory feeds")
+    q.set_defaults(func=cmd_project_list)
 
     p = sub.add_parser("status", help="what this machine holds and where it points")
     p.set_defaults(func=cmd_status)
