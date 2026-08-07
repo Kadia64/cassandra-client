@@ -189,3 +189,34 @@ def test_responses_are_serialisable_json_rpc() -> None:
         line = json.dumps(response)
         assert "\n" not in line
         assert json.loads(line)["jsonrpc"] == "2.0"
+
+
+# ---- status ----------------------------------------------------------------
+
+def test_set_status_writes_a_handoff_not_a_log(brain) -> None:
+    """Three headings, overwritten. History lives in transcripts and git; a
+    status that accumulates stops being readable in ten seconds."""
+    rpc("tools/call", {"name": "project_set_status", "arguments": {
+        "slug": "mygame", "stands": "combat loop works",
+        "next": "- tune damage\n- add sfx", "blocked": "waiting on art"}})
+
+    call = brain[-1]
+    assert call["method"] == "PUT"
+    assert call["body"]["path"] == "context/status.md"
+    body = call["body"]["text"]
+    assert "## Where it stands" in body and "combat loop works" in body
+    assert "## What's next" in body and "tune damage" in body
+    assert "## Blocked" in body and "waiting on art" in body
+
+
+def test_status_omits_the_blocked_heading_when_nothing_is(brain) -> None:
+    rpc("tools/call", {"name": "project_set_status", "arguments": {
+        "slug": "mygame", "stands": "fine", "next": "carry on"}})
+    assert "## Blocked" not in brain[-1]["body"]["text"]
+
+
+def test_status_tool_tells_the_model_when_to_call_it() -> None:
+    """It is only useful if it is written at the END of a session, so the
+    description has to say so — nothing else will."""
+    tools = {t["name"]: t for t in rpc("tools/list")["result"]["tools"]}
+    assert "END" in tools["project_set_status"]["description"]

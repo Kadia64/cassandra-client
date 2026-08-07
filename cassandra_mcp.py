@@ -38,7 +38,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 TIMEOUT = 30
 
@@ -188,6 +188,44 @@ def project_recent(slug: str) -> str:
         for idea in ideas[:5]:
             parts.append(f"- {idea['file']}\n{idea['text'][:400]}")
     return "\n\n".join(parts) or f"Nothing recorded yet for {slug}."
+
+
+@tool("project_set_status",
+      "Update where a project stands and what is next. Call this at the END of a working session, "
+      "before finishing — a few sentences on what was done, what remains, and anything blocked. "
+      "It replaces the previous status, and it is what the next session reads to pick up.",
+      params={"slug": SLUG,
+              "stands": {"type": "string",
+                         "description": "Where the project is now, in a few sentences."},
+              "next": {"type": "string",
+                       "description": "What to do next, as a short list."},
+              "blocked": {"type": "string",
+                          "description": "Anything waiting on a decision or someone else. "
+                                         "Omit if nothing is."}},
+      required=("slug", "stands", "next"))
+def project_set_status(slug: str, stands: str, next: str, blocked: str = "") -> str:
+    """A handoff, not a log.
+
+    Overwritten rather than appended: history already lives in the transcripts
+    and in git, and a status that accumulates stops being the thing you can read
+    in ten seconds to find out where you are. Three headings, deliberately —
+    more structure would invite it to grow.
+    """
+    body = (f"# Status\n\n_Updated {_today()}_\n\n"
+            f"## Where it stands\n\n{stands.strip()}\n\n"
+            f"## What's next\n\n{next.strip()}\n")
+    if blocked.strip():
+        body += f"\n## Blocked\n\n{blocked.strip()}\n"
+    call_brain("PUT", f"/api/projects/{slug}/file",
+               {"path": "context/status.md", "text": body})
+    return f"Status updated for {slug}."
+
+
+def _today() -> str:
+    # The brain stamps everything else; this is the one string written from a
+    # client machine, so it uses the machine's own date.
+    import datetime
+    return datetime.date.today().isoformat()
 
 
 @tool("project_note",
