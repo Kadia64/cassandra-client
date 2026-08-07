@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 DEFAULT_INTERVAL = 300
 TIMEOUT = 60
@@ -105,14 +105,23 @@ def read_cwd(data: bytes, dirname: str) -> str:
     return decode_cwd(dirname)
 
 
-def is_excluded(cwd: str, exclude: list[str]) -> bool:
+def is_excluded(cwd: str, exclude: list[str] | None,
+                exact: list[str] | None = None) -> bool:
     """Directories the server has said not to sync.
 
     Not every Claude session is project work — fixing the printer, a one-off
     script. Those are noise at best, and at worst something you would rather
-    was never uploaded. The list comes down the heartbeat, so changing it is one
-    call rather than an edit on every machine.
+    was never uploaded. The lists come down the heartbeat, so changing them is
+    one call rather than an edit on every machine.
+
+    `exclude` covers a directory and everything under it; `exact` covers only
+    sessions run directly in it. The distinction matters because a home
+    directory is the parent of every project, so excluding it recursively
+    silences the whole machine.
     """
+    for base in exact or []:
+        if cwd == str(base).rstrip("/\\"):
+            return True
     for base in exclude or []:
         base = str(base).rstrip("/\\")
         if base and (cwd == base or cwd.startswith(base + "/")
@@ -121,7 +130,8 @@ def is_excluded(cwd: str, exclude: list[str]) -> bool:
     return False
 
 
-def local_sessions(root: Path, exclude: list[str] | None = None) -> list[dict]:
+def local_sessions(root: Path, exclude: list[str] | None = None,
+                   exact: list[str] | None = None) -> list[dict]:
     """Every transcript on this machine, with its hash."""
     out = []
     if not root.is_dir():
@@ -135,7 +145,7 @@ def local_sessions(root: Path, exclude: list[str] | None = None) -> list[dict]:
             except OSError:
                 continue
             cwd = read_cwd(data, folder.name)
-            if is_excluded(cwd, exclude or []):
+            if is_excluded(cwd, exclude, exact):
                 continue
             out.append({
                 "session_id": path.stem,
@@ -315,7 +325,8 @@ def cmd_register(args) -> None:
     print(f"registered as {machine_id}; token saved to {CONFIG}")
 
 
-def cmd_sync(args, exclude: list[str] | None = None) -> int:
+def cmd_sync(args, exclude: list[str] | None = None,
+             exact: list[str] | None = None) -> int:
     """One pass. `exclude` comes from the heartbeat when `watch` calls this;
     a bare `sync` has not spoken to the server yet, so it fetches the list
     itself rather than uploading directories the operator has excluded."""
@@ -325,10 +336,12 @@ def cmd_sync(args, exclude: list[str] | None = None) -> int:
 
     if exclude is None:
         beat = try_heartbeat(cfg)
-        exclude = (beat or {}).get("config", {}).get("exclude") or []
+        config = (beat or {}).get("config", {})
+        exclude = config.get("exclude") or []
+        exact = config.get("exclude_exact") or []
 
     root = transcript_root(sys.platform, Path.home())
-    sessions = local_sessions(root, exclude)
+    sessions = local_sessions(root, exclude, exact)
     if not sessions:
         print(f"no transcripts under {root}")
         return 0
@@ -415,7 +428,8 @@ def cmd_watch(args) -> None:
                 return                      # ditto, on the new code
 
             try:
-                cmd_sync(args, beat.get("config", {}).get("exclude"))
+                cmd_sync(args, beat.get("config", {}).get("exclude") or [],
+                         beat.get("config", {}).get("exclude_exact") or [])
             except SystemExit as exc:       # a transient outage must not end the watch
                 print(f"sync failed: {exc}")
             except Exception as exc:        # noqa: BLE001 — same reasoning

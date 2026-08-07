@@ -228,3 +228,11 @@ def test_watch_passes_its_own_exclusions_through(tmp_path, monkeypatch) -> None:
     client.cmd_sync(object(), exclude=["/a/work"])
     assert not any(p.endswith("/heartbeat") for p, _ in calls), "asked twice"
     assert not any(p.endswith("/upload") for p, _ in calls)
+
+
+def test_an_exact_exclusion_does_not_swallow_the_tree() -> None:
+    """A home directory is the parent of every project; excluding it
+    recursively silences the machine."""
+    assert client.is_excluded("/var/home/wes", [], ["/var/home/wes"])
+    assert not client.is_excluded("/var/home/wes/Desktop/Game", [], ["/var/home/wes"])
+    assert client.is_excluded("/var/home/wes/Desktop/Game", ["/var/home/wes"], [])
