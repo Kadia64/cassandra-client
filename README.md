@@ -95,3 +95,39 @@ python3 -m pytest test_client.py
 
 Covers the parts that are platform-specific or lossy — path handling, cwd
 recovery, the rollback watchdog — so every platform is checked from one machine.
+
+## MCP server — project context in any Claude session
+
+`cassandra_mcp.py` exposes Cassandra's projects to Claude Code as tools, so a
+session can read what a project is and where it stands without being told.
+
+Add to `~/.claude.json` (global) or a project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "cassandra": {
+      "command": "python3",
+      "args": ["/Users/YOU/.cassandra/client/cassandra_mcp.py"]
+    }
+  }
+}
+```
+
+Nothing else to configure — it reuses this machine's fleet credentials.
+
+| tool | what it gives you |
+|---|---|
+| `project_list` | every project and its status |
+| `project_context` | what a project is, where it stands, where its code lives |
+| `project_recent` | what was last worked on and what is next |
+| `project_files` | what is in the project |
+| `project_read` | one file from it |
+| `project_note` | capture an idea against it |
+
+**Context, not development.** Reading a project and firing an idea at it — the
+session itself is for the actual work.
+
+Adding a tool is one decorated function in `cassandra_mcp.py`; the schema is
+declared beside the implementation and the JSON the model sees is generated
+from it.
