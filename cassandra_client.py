@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 DEFAULT_INTERVAL = 300
 TIMEOUT = 60
@@ -255,7 +255,16 @@ def apply_update(want: str) -> bool:
     if resolved.strip() == here:
         return False
 
-    code, out = git("checkout", "--quiet", "--force", resolved.strip())
+    # Tracking `main` stays *on* main; only a real pin detaches. Checking out
+    # the sha either way left every canary in detached HEAD, where `git pull`
+    # refuses to work and the checkout looks broken to anyone who opens it.
+    # A pinned machine being detached is correct — it is pinned.
+    if want == "main":
+        code, out = git("checkout", "--quiet", "main")
+        if code == 0:
+            code, out = git("reset", "--quiet", "--hard", "origin/main")
+    else:
+        code, out = git("checkout", "--quiet", "--force", resolved.strip())
     if code != 0:
         print(f"update: checkout failed — {out[:200]}")
         return False
