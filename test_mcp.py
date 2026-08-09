@@ -566,3 +566,89 @@ def test_read_transcript_stops_offering_at_the_end(brain) -> None:
     out = text_of(rpc("tools/call", {"name": "read_transcript",
                                      "arguments": {"id": "tsc-aaa"}}))
     assert "offset=" not in out
+
+
+# ---- creating things --------------------------------------------------------
+# These write into the repo, because the VM cannot: the fleet is upload-only and
+# has no checkout. The template comes from the server; the session writes it.
+
+@pytest.fixture
+def in_repo(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+SCAFFOLD = {
+    ".claude/cassandra.json": '{"id": "prj-abc", "slug": "demo"}\n',
+    ".mcp.json": '{"mcpServers": {}}\n',
+    "CLAUDE.md": "# Demo\n",
+}
+
+
+def test_project_new_writes_the_scaffold_into_the_repo(brain, in_repo) -> None:
+    brain.responses["/api/projects"] = {
+        "slug": "demo", "name": "Demo", "scaffold": SCAFFOLD}
+    out = text_of(rpc("tools/call", {"name": "project_new",
+                                     "arguments": {"name": "Demo"}}))
+    assert (in_repo / ".claude/cassandra.json").exists()
+    assert (in_repo / ".mcp.json").exists()
+    assert "demo" in out
+
+
+def test_project_new_reports_the_cwd_it_linked(brain, in_repo) -> None:
+    """The session is the only thing that knows where it is running, and that is
+    what stops transcripts landing in the inbox."""
+    brain.responses["/api/projects"] = {"slug": "demo", "name": "Demo", "scaffold": {}}
+    rpc("tools/call", {"name": "project_new", "arguments": {"name": "Demo"}})
+    assert brain[-1]["body"]["cwd"] == str(in_repo)
+
+
+def test_project_new_never_clobbers_an_existing_file(brain, in_repo) -> None:
+    # CLAUDE.md and .gitignore usually exist already and are not ours to replace.
+    (in_repo / "CLAUDE.md").write_text("mine, do not touch")
+    brain.responses["/api/projects"] = {
+        "slug": "demo", "name": "Demo", "scaffold": SCAFFOLD}
+    out = text_of(rpc("tools/call", {"name": "project_new",
+                                     "arguments": {"name": "Demo"}}))
+    assert (in_repo / "CLAUDE.md").read_text() == "mine, do not touch"
+    assert "Left alone" in out and "CLAUDE.md" in out
+
+
+def test_module_new_writes_its_scaffold_and_start_command(brain, in_repo) -> None:
+    brain.responses["/api/projects/demo/modules"] = {
+        "slug": "pixel-sim", "title": "Pixel Sim",
+        "scaffold": {".claude/modules/pixel-sim/reference.md": "# Pixel Sim\n",
+                     ".claude/commands/start-pixel-sim.md": "brief\n"}}
+    out = text_of(rpc("tools/call", {"name": "module_new",
+                                     "arguments": {"slug": "demo",
+                                                   "title": "Pixel Sim"}}))
+    assert (in_repo / ".claude/modules/pixel-sim/reference.md").exists()
+    assert (in_repo / ".claude/commands/start-pixel-sim.md").exists()
+    # The next step is named, because a registered module nobody files against
+    # is just an empty folder.
+    assert "project_note" in out
+
+
+def test_module_list_says_so_when_there_are_none(brain) -> None:
+    brain.responses["/api/projects/demo/modules"] = {"modules": []}
+    out = text_of(rpc("tools/call", {"name": "module_list",
+                                     "arguments": {"slug": "demo"}}))
+    assert "module_new" in out
+
+
+def test_project_note_passes_the_module_through(brain) -> None:
+    brain.responses["/api/projects/demo/ideas"] = {
+        "file": "x.md", "status": "raw", "module": "pixel-sim"}
+    out = text_of(rpc("tools/call", {"name": "project_note",
+                                     "arguments": {"slug": "demo", "text": "sand",
+                                                   "module": "pixel-sim"}}))
+    assert brain[-1]["body"]["module"] == "pixel-sim"
+    assert "pixel-sim" in out
+
+
+def test_project_note_omits_an_empty_module(brain) -> None:
+    # Capture stays one gesture: an untagged idea must not become module="".
+    brain.responses["/api/projects/demo/ideas"] = {"file": "x.md", "status": "raw"}
+    rpc("tools/call", {"name": "project_note",
+                       "arguments": {"slug": "demo", "text": "sand"}})
+    assert "module" not in brain[-1]["body"]

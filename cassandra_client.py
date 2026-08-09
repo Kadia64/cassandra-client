@@ -105,6 +105,39 @@ def read_cwd(data: bytes, dirname: str) -> str:
     return decode_cwd(dirname)
 
 
+# The repo marker `.claude/cassandra.json`, written by `project_new`.
+#
+# Routing used to be `(machine_id, cwd) -> project` on the server, which makes
+# an absolute path load-bearing: rename the folder and transcripts silently
+# stop filing, and a clone on a second machine has to be registered by hand.
+# The marker is committed, so it travels with the repo.
+MARKER = Path(".claude") / "cassandra.json"
+
+
+def read_marker(cwd: str) -> str | None:
+    """The project id for a session that ran in `cwd`, or None.
+
+    Walks **up** from the directory, the way git finds `.git`: a session started
+    in `engine-core/` belongs to the repo above it, and the transcript records
+    the deepest directory rather than the root.
+    """
+    try:
+        here = Path(cwd).resolve()
+    except (OSError, ValueError):
+        return None
+    for folder in (here, *here.parents):
+        found = folder / MARKER
+        try:
+            if not found.is_file():
+                continue
+            data = json.loads(found.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("id"), str):
+            return data["id"]
+    return None
+
+
 def is_excluded(cwd: str, exclude: list[str] | None,
                 exact: list[str] | None = None) -> bool:
     """Directories the server has said not to sync.
@@ -151,6 +184,7 @@ def local_sessions(root: Path, exclude: list[str] | None = None,
                 "session_id": path.stem,
                 "hash": hashlib.sha256(data).hexdigest(),
                 "cwd": cwd,
+                "project_id": read_marker(cwd) or "",
                 "dirname": folder.name,
                 "bytes": len(data),
                 "path": str(path),
@@ -376,6 +410,7 @@ def cmd_sync(args, exclude: list[str] | None = None,
         result = post(cfg, "/api/fleet/sync/upload", {
             "session_id": session_id,
             "cwd": session["cwd"],
+            "project_id": session.get("project_id") or "",
             "dirname": session["dirname"],
             "content": content,
         })

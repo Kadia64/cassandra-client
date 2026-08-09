@@ -258,10 +258,14 @@ def _today() -> str:
               "priority": {"type": "string", "enum": list(PRIORITIES),
                            "description": "How much it matters."},
               "complexity": {"type": "string", "enum": list(COMPLEXITIES),
-                             "description": "How much work it looks like."}},
+                             "description": "How much work it looks like."},
+              "module": {"type": "string",
+                         "description": "Which module the idea is about, from "
+                                        "module_list. Omit for the project as "
+                                        "a whole."}},
       required=("slug", "text"))
 def project_note(slug: str, text: str, column: str = "", priority: str = "",
-                 complexity: str = "") -> str:
+                 complexity: str = "", module: str = "") -> str:
     body: dict[str, Any] = {"text": text}
     if column:
         body["status"] = column
@@ -269,9 +273,12 @@ def project_note(slug: str, text: str, column: str = "", priority: str = "",
         body["priority"] = priority
     if complexity:
         body["complexity"] = complexity
+    if module:
+        body["module"] = module
     result = call_brain("POST", f"/api/projects/{slug}/ideas", body)
     where = result.get("status", "raw")
-    return f"Saved to {slug} as {result['file']} (column: {where})."
+    tagged = f", module: {result['module']}" if result.get("module") else ""
+    return f"Saved to {slug} as {result['file']} (column: {where}{tagged})."
 
 
 @tool("project_ideas",
@@ -475,6 +482,104 @@ def roadmap_expand(slug: str, goal: str, roadmap: str = "main", title: str = "")
                      f"/api/projects/{slug}/roadmaps/{roadmap}/goals/{goal}/expand", body)
     return (f"Created sub-roadmap '{sub['slug']}' ({sub['title']}). "
             f"Add its steps with roadmap_add(slug='{slug}', roadmap='{sub['slug']}', ...).")
+
+
+# ---- creating things --------------------------------------------------------
+# The VM cannot write into your repo — the fleet is upload-only and has no
+# checkout — so these tools register the thing centrally and hand back the files
+# for *this* session to write. That keeps one template on the server (eight
+# projects cannot drift into eight templates) while the files still live where
+# git can carry them between machines.
+
+
+def _write_scaffold(scaffold: dict[str, str]) -> list[str]:
+    """Write `{relative path: contents}` under the cwd. Never overwrites.
+
+    Skipping rather than clobbering matters for `.gitignore` and `CLAUDE.md`,
+    which often exist already and are not ours to replace.
+    """
+    written = []
+    for relative, body in sorted(scaffold.items()):
+        target = Path.cwd() / relative
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        written.append(relative)
+    return written
+
+
+@tool("project_new",
+      "Register the repository you are working in as a Cassandra project, and "
+      "scaffold it. Creates the project centrally, links this machine and "
+      "directory so its Claude Code transcripts file themselves, and writes "
+      ".claude/cassandra.json, .mcp.json and CLAUDE.md into the repo. Run this "
+      "from the repo root.",
+      params={
+          "name": {"type": "string",
+                   "description": "What the project is called, in your words. "
+                                  "The slug is derived from it; the folder and "
+                                  "GitHub names do not have to match."},
+          "description": {"type": "string", "description": "One or two sentences."},
+      },
+      required=("name",))
+def project_new(name: str, description: str = "") -> str:
+    cfg = load_config()
+    project = call_brain("POST", "/api/projects", {
+        "name": name, "description": description,
+        "machine_id": cfg.get("machine_id", ""), "cwd": str(Path.cwd()),
+    })
+    written = _write_scaffold(project.get("scaffold") or {})
+    lines = [f"Created project '{project['slug']}' ({project['name']}).",
+             f"Linked {cfg.get('machine_id', '?')}:{Path.cwd()} — transcripts "
+             f"from here now file themselves, including ones already uploaded."]
+    if written:
+        lines.append("Wrote: " + ", ".join(written))
+    skipped = sorted(set(project.get("scaffold") or {}) - set(written))
+    if skipped:
+        lines.append("Left alone (already present): " + ", ".join(skipped))
+    lines.append("Commit these — .claude/cassandra.json is what identifies this "
+                 "repo, so cloning it elsewhere needs no further setup.")
+    return "\n".join(lines)
+
+
+@tool("module_new",
+      "Start a new module — a durable area of work inside a project, like "
+      "'pixel simulation' or 'world generation'. Registers it and writes its "
+      "reference, decisions and checkpoints scaffold plus a /start-<module> "
+      "command into this repo.",
+      params={"slug": SLUG,
+              "title": {"type": "string",
+                        "description": "The module's name, in your words."},
+              "description": {"type": "string",
+                              "description": "One line on what it covers."}},
+      required=("slug", "title"))
+def module_new(slug: str, title: str, description: str = "") -> str:
+    module = call_brain("POST", f"/api/projects/{slug}/modules",
+                        {"title": title, "description": description})
+    written = _write_scaffold(module.get("scaffold") or {})
+    return "\n".join([
+        f"Module '{module['slug']}' ({module['title']}) registered on {slug}.",
+        ("Wrote: " + ", ".join(written)) if written else "No files written.",
+        f"Ideas can now be filed against it: "
+        f"project_note(slug='{slug}', module='{module['slug']}', text=...).",
+    ])
+
+
+@tool("module_list",
+      "The modules of a project — the areas of work it is divided into.",
+      params={"slug": SLUG}, required=("slug",))
+def module_list(slug: str) -> str:
+    modules = call_brain("GET", f"/api/projects/{slug}/modules").get("modules", [])
+    if not modules:
+        return f"{slug} has no modules yet. Create one with module_new."
+    lines = []
+    for m in modules:
+        detail = f"{m['checkpoints']} checkpoint(s)"
+        if m.get("description"):
+            detail += f" — {m['description']}"
+        lines.append(f"{m['slug']:<22} {detail}")
+    return "\n".join(lines)
 
 
 # ---- the transcript corpus --------------------------------------------------

@@ -236,3 +236,41 @@ def test_an_exact_exclusion_does_not_swallow_the_tree() -> None:
     assert client.is_excluded("/var/home/wes", [], ["/var/home/wes"])
     assert not client.is_excluded("/var/home/wes/Desktop/Game", [], ["/var/home/wes"])
     assert client.is_excluded("/var/home/wes/Desktop/Game", ["/var/home/wes"], [])
+
+
+# ---- the repo marker --------------------------------------------------------
+# `.claude/cassandra.json` is what makes routing survive a folder rename and a
+# clone onto another machine. It is committed, so it travels with the repo.
+
+def test_marker_is_found_from_the_repo_root(tmp_path) -> None:
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude/cassandra.json").write_text('{"id": "prj-abc", "slug": "demo"}')
+    assert client.read_marker(str(tmp_path)) == "prj-abc"
+
+
+def test_marker_is_found_from_a_subdirectory(tmp_path) -> None:
+    """A session started in `engine-core/` belongs to the repo above it, and the
+    transcript records the deepest directory — so this has to walk up."""
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude/cassandra.json").write_text('{"id": "prj-abc"}')
+    deep = tmp_path / "engine-core" / "src"
+    deep.mkdir(parents=True)
+    assert client.read_marker(str(deep)) == "prj-abc"
+
+
+def test_no_marker_is_not_an_error(tmp_path) -> None:
+    # Unmarked repos fall back to path routing rather than failing to sync.
+    assert client.read_marker(str(tmp_path)) is None
+    assert client.read_marker("/does/not/exist") is None
+
+
+def test_a_corrupt_marker_is_ignored(tmp_path) -> None:
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude/cassandra.json").write_text("{not json")
+    assert client.read_marker(str(tmp_path)) is None
+
+
+def test_a_marker_without_an_id_is_ignored(tmp_path) -> None:
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude/cassandra.json").write_text('{"slug": "demo"}')
+    assert client.read_marker(str(tmp_path)) is None
