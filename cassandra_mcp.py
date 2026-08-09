@@ -38,7 +38,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 CONFIG = Path.home() / ".cassandra" / "client.json"
 TIMEOUT = 30
 
@@ -117,6 +117,17 @@ def tool(name: str, description: str, *,
 
 SLUG = {"type": "string", "description": "The project's slug, from project_list."}
 
+# The board's vocabularies, mirrored from src/ai/projects.py. Spelled out in the
+# tool schemas rather than described in prose, so a model picks from a list
+# instead of guessing a word the brain will reject.
+COLUMNS = ("raw", "quick", "big", "done")
+PRIORITIES = ("high", "normal", "low")
+COMPLEXITIES = ("trivial", "small", "medium", "large")
+
+COLUMN = {"type": "string", "enum": list(COLUMNS),
+          "description": "Which board column: raw (unsorted), quick (small and "
+                         "obvious), big (needs expanding), done."}
+
 
 @tool("project_list", "List the projects Cassandra knows about, with their status.")
 def project_list() -> str:
@@ -182,6 +193,13 @@ def project_recent(slug: str) -> str:
     status = _read(slug, "context/status.md")
     if status:
         parts.append(f"## status\n{status}")
+    # The roadmap belongs in the session kickoff more than anywhere else: it is
+    # literally "what is next", and a session that has to be told to go and look
+    # for it will not. Folded in rather than left to a separate call.
+    try:
+        parts.append(f"## roadmap\n{_roadmap_text(slug)}")
+    except RuntimeError:
+        pass                            # no roadmap yet — not worth a line
     ideas = call_brain("GET", f"/api/projects/{slug}").get("ideas", [])
     if ideas:
         parts.append("## recent ideas")
@@ -230,13 +248,86 @@ def _today() -> str:
 
 @tool("project_note",
       "Capture an idea against a project. The text is stored verbatim, immediately — "
-      "use this whenever the user says something worth keeping.",
+      "use this whenever the user says something worth keeping. The three "
+      "classifiers are optional: omit them unless the user actually said where "
+      "the idea belongs, and it lands unsorted in `raw` at the bottom of both "
+      "scales, which is the honest default for a thought nobody has assessed.",
       params={"slug": SLUG,
-              "text": {"type": "string", "description": "The idea, in the user's own words."}},
+              "text": {"type": "string", "description": "The idea, in the user's own words."},
+              "column": COLUMN,
+              "priority": {"type": "string", "enum": list(PRIORITIES),
+                           "description": "How much it matters."},
+              "complexity": {"type": "string", "enum": list(COMPLEXITIES),
+                             "description": "How much work it looks like."}},
       required=("slug", "text"))
-def project_note(slug: str, text: str) -> str:
-    result = call_brain("POST", f"/api/projects/{slug}/ideas", {"text": text})
-    return f"Saved to {slug} as {result['file']}."
+def project_note(slug: str, text: str, column: str = "", priority: str = "",
+                 complexity: str = "") -> str:
+    body: dict[str, Any] = {"text": text}
+    if column:
+        body["status"] = column
+    if priority:
+        body["priority"] = priority
+    if complexity:
+        body["complexity"] = complexity
+    result = call_brain("POST", f"/api/projects/{slug}/ideas", body)
+    where = result.get("status", "raw")
+    return f"Saved to {slug} as {result['file']} (column: {where})."
+
+
+@tool("project_ideas",
+      "The project's idea board, grouped by column. Read this before adding an "
+      "idea that might already be there, or to answer what is queued up.",
+      params={"slug": SLUG,
+              "column": {"type": "string", "enum": list(COLUMNS),
+                         "description": "Only this column. Omit for the whole board."}},
+      required=("slug",))
+def project_ideas(slug: str, column: str = "") -> str:
+    ideas = call_brain("GET", f"/api/projects/{slug}").get("ideas", [])
+    wanted = (column,) if column else COLUMNS
+    out = []
+    for name in wanted:
+        rows = [i for i in ideas if i.get("status") == name]
+        out.append(f"## {name} ({len(rows)})")
+        for i in rows:
+            pin = "PINNED " if i.get("pinned") else ""
+            out.append(f"- {pin}{i['title']}  [{i.get('priority')}/{i.get('complexity')}]"
+                       f"  {i['file']}")
+        if not rows:
+            out.append("- (empty)")
+    return "\n".join(out)
+
+
+@tool("project_idea_set",
+      "Move an idea to another column, or change its priority, complexity or pin. "
+      "Only the fields you pass are changed.",
+      params={"slug": SLUG,
+              "file": {"type": "string",
+                       "description": "The idea's filename, from project_ideas."},
+              "column": COLUMN,
+              "priority": {"type": "string", "enum": list(PRIORITIES),
+                           "description": "How much it matters."},
+              "complexity": {"type": "string", "enum": list(COMPLEXITIES),
+                             "description": "How much work it looks like."},
+              "pinned": {"type": "boolean",
+                         "description": "Hold it at the top of its column."}},
+      required=("slug", "file"))
+def project_idea_set(slug: str, file: str, column: str = "", priority: str = "",
+                     complexity: str = "", pinned: bool | None = None) -> str:
+    body: dict[str, Any] = {}
+    if column:
+        body["status"] = column
+    if priority:
+        body["priority"] = priority
+    if complexity:
+        body["complexity"] = complexity
+    if pinned is not None:
+        body["pinned"] = pinned
+    if not body:
+        return "Nothing to change — pass at least one of column, priority, complexity, pinned."
+    result = call_brain("PUT", f"/api/projects/{slug}/ideas/{file}", body)
+    return (f"{result['title']} → column:{result['status']} "
+            f"priority:{result['priority']} complexity:{result['complexity']}"
+            + (" pinned" if result.get("pinned") else ""))
 
 
 def _read(slug: str, path: str) -> str | None:
@@ -244,6 +335,243 @@ def _read(slug: str, path: str) -> str | None:
         return call_brain("GET", f"/api/projects/{slug}/file", params={"path": path}).get("text")
     except RuntimeError:
         return None
+
+
+# ---- roadmaps ---------------------------------------------------------------
+# What a project is trying to get done. A roadmap is a flat ordered list of
+# goals; a goal that has been built out expands into named sub-roadmaps, and
+# that is the only hierarchy — goals never nest inside goals.
+#
+# Four tools, not six. Listing folds into `roadmap_read` (reading `main` already
+# names every sub-roadmap) and reordering folds into `roadmap_set`, because the
+# server takes `index` on the same call. This server is meant to stay small.
+#
+# There is deliberately **no delete**. `roadmap_set(state="dropped")` retires a
+# goal and keeps it in the history; erasing one is a panel action. An agent that
+# can quietly remove the record of a decision is a worse trade than an agent
+# that leaves a struck-through line behind.
+
+ROADMAP = {"type": "string",
+           "description": "Roadmap name. Omit for 'main', the project's top-level roadmap. "
+                          "Sub-roadmap names come from roadmap_read."}
+GOAL = {"type": "string",
+        "description": "The goal's id, e.g. 'gol-a1b2c3d4e5f6', exactly as roadmap_read shows it."}
+
+STATE_BOX = {"todo": " ", "doing": ">", "blocked": "!", "done": "x", "dropped": "~"}
+
+
+def _roadmap_text(slug: str, name: str = "main") -> str:
+    """One roadmap as a listing the model can act on.
+
+    Rendered here rather than using the brain's `?format=md`, for one reason:
+    that render is for reading and carries no ids, and every write tool needs
+    the goal's id. So ids are on every line, in full — a truncated id would be
+    copied straight into a call that then fails.
+    """
+    data = call_brain("GET", f"/api/projects/{slug}/roadmaps/{name}")
+    progress = data.get("progress") or {}
+    lines = [f"# {data.get('title', name)} — roadmap '{data.get('slug', name)}' "
+             f"({progress.get('done', 0)}/{progress.get('total', 0)} done)"]
+
+    parent = data.get("parent")
+    if parent:
+        lines.append(f"(a sub-roadmap of '{parent['roadmap']}')")
+    lines.append("")
+
+    goals = data.get("goals") or []
+    if not goals:
+        lines.append("(no goals yet — roadmap_add puts one here)")
+    for goal in goals:
+        box = STATE_BOX.get(goal.get("state", "todo"), " ")
+        line = f"- [{box}] {goal.get('text', '')}   {goal['id']}"
+        lines.append(line)
+        if goal.get("note"):
+            lines.append(f"        note: {goal['note']}")
+        for child in goal.get("children") or []:
+            done = (child.get("progress") or {}).get("done", 0)
+            total = (child.get("progress") or {}).get("total", 0)
+            lines.append(f"        → sub-roadmap '{child['name']}' ({done}/{total} done)"
+                         + ("  [MISSING]" if child.get("missing") else ""))
+    return "\n".join(lines)
+
+
+@tool("roadmap_read",
+      "The project's roadmap: its goals, which are done, and which have been broken out into "
+      "sub-roadmaps. Read this when picking up work, before proposing what to do next. "
+      "Every goal line ends with the id you pass to roadmap_set and roadmap_expand.",
+      params={"slug": SLUG, "roadmap": ROADMAP}, required=("slug",))
+def roadmap_read(slug: str, roadmap: str = "main") -> str:
+    try:
+        return _roadmap_text(slug, roadmap)
+    except RuntimeError as exc:
+        if "404" in str(exc):
+            return (f"{slug} has no roadmap '{roadmap}' yet. "
+                    f"roadmap_add creates 'main' the first time you add a goal to it.")
+        raise
+
+
+@tool("roadmap_add",
+      "Add a goal to a roadmap. On 'main' these are the project's top-level goals — a thing to "
+      "achieve, which may be a rough idea; on a sub-roadmap they are the implementation steps. "
+      "Use this when the user describes something they want done. Creates 'main' if it is the "
+      "project's first goal.",
+      params={"slug": SLUG, "roadmap": ROADMAP,
+              "text": {"type": "string",
+                       "description": "The goal, in one line, in the user's own terms."},
+              "note": {"type": "string",
+                       "description": "Optional detail — a constraint, an approach, a caveat."}},
+      required=("slug", "text"))
+def roadmap_add(slug: str, text: str, roadmap: str = "main", note: str = "") -> str:
+    body: dict[str, Any] = {"text": text}
+    if note:
+        body["note"] = note
+    goal = call_brain("POST", f"/api/projects/{slug}/roadmaps/{roadmap}/goals", body)
+    return f"Added to '{roadmap}': {goal['text']}   {goal['id']}"
+
+
+@tool("roadmap_set",
+      "Change a goal: check it off, move it back, reword it, or reorder it. "
+      "state is one of todo, doing, blocked, done, dropped — 'dropped' is how a goal is "
+      "abandoned, and keeps it on the record struck through. Call this as work actually "
+      "completes, not in a batch at the end.",
+      params={"slug": SLUG, "roadmap": ROADMAP, "goal": GOAL,
+              "state": {"type": "string", "enum": list(STATE_BOX),
+                        "description": "The goal's new state."},
+              "text": {"type": "string", "description": "Reword the goal."},
+              "note": {"type": "string", "description": "Replace the goal's note."},
+              "position": {"type": "integer",
+                           "description": "Move the goal to this 0-based position."}},
+      required=("slug", "goal"))
+def roadmap_set(slug: str, goal: str, roadmap: str = "main", state: str = "",
+                text: str = "", note: str = "", position: int | None = None) -> str:
+    body: dict[str, Any] = {}
+    if state:
+        body["state"] = state
+    if text:
+        body["text"] = text
+    if note:
+        body["note"] = note
+    if position is not None:
+        body["index"] = position
+    if not body:
+        return "Nothing to change — pass state, text, note or position."
+    updated = call_brain("PUT", f"/api/projects/{slug}/roadmaps/{roadmap}/goals/{goal}", body)
+    return f"[{STATE_BOX.get(updated['state'], ' ')}] {updated['text']}"
+
+
+@tool("roadmap_expand",
+      "Turn a goal into a sub-roadmap of its own — the move for 'this is no longer just an "
+      "idea, here is how it breaks down'. Returns the new roadmap's name; pass that as "
+      "`roadmap` to roadmap_add to fill in the steps. A goal can hold several, for working on "
+      "more than one part of it at once.",
+      params={"slug": SLUG, "roadmap": ROADMAP, "goal": GOAL,
+              "title": {"type": "string",
+                        "description": "Title for the sub-roadmap. Its short name is derived "
+                                       "from this, so keep it specific."}},
+      required=("slug", "goal"))
+def roadmap_expand(slug: str, goal: str, roadmap: str = "main", title: str = "") -> str:
+    body = {"title": title} if title else {}
+    sub = call_brain("POST",
+                     f"/api/projects/{slug}/roadmaps/{roadmap}/goals/{goal}/expand", body)
+    return (f"Created sub-roadmap '{sub['slug']}' ({sub['title']}). "
+            f"Add its steps with roadmap_add(slug='{slug}', roadmap='{sub['slug']}', ...).")
+
+
+# ---- the transcript corpus --------------------------------------------------
+# Every conversation Cassandra holds, whatever it came from: Claude Code
+# sessions synced off each machine, and claude.ai history imported from an
+# account export. One corpus with a `source` facet, so a search spans all of it
+# by default (migration 0006).
+#
+# Deliberately *not* project-scoped, unlike everything above. Most of a web
+# history is not project work, and making the corpus reachable only through a
+# project would hide the majority of it.
+#
+# If these ever need to be handed to something that must not touch project
+# state, this section is the seam to lift into a read-only server of its own —
+# the split is about write permissions, not about topic.
+
+@tool("search_transcripts",
+      "Search every past conversation — Claude Code sessions from any machine, "
+      "and claude.ai chat history. Use this to check whether a problem, "
+      "decision or idea has come up before, and to find what was concluded. "
+      "Returns the best-matching conversations with a snippet of the match; "
+      "read_transcript opens one in full.",
+      params={
+          "query": {"type": "string",
+                    "description": "Words to look for. Supports SQLite FTS5 "
+                                   "syntax: quote a phrase, AND/OR/NOT, "
+                                   "trailing * to match a prefix."},
+          "source": {"type": "string", "enum": ["claude_code", "claude_web"],
+                     "description": "Restrict to one source. Omit to search everything."},
+          "project": {"type": "string",
+                      "description": "Restrict to one project's slug. Most "
+                                     "claude.ai chats belong to no project."},
+          "since": {"type": "string",
+                    "description": "Only conversations on or after this date, "
+                                   "as YYYY-MM-DD."},
+          "limit": {"type": "integer", "description": "Max results (default 10)."},
+      },
+      required=("query",))
+def search_transcripts(query: str, source: str = "", project: str = "",
+                       since: str = "", limit: int = 10) -> str:
+    params: dict[str, Any] = {"q": query, "limit": limit}
+    for key, value in (("source", source), ("project", project), ("since", since)):
+        if value:
+            params[key] = value
+    found = call_brain("GET", "/api/transcripts/search", params=params)
+    hits = found.get("results", [])
+    if not hits:
+        return f"No conversation mentions {query!r}."
+
+    lines = [f"{len(hits)} conversation(s) matching {query!r}:", ""]
+    for hit in hits:
+        when = (hit.get("started_at") or hit.get("received_at") or "")[:10]
+        where = hit.get("project_slug") or "unfiled"
+        title = hit.get("title") or "(untitled)"
+        lines.append(f"[{hit['id']}] {when}  {hit['source']}  {where}")
+        lines.append(f"  {title}")
+        # The snippet carries « » around the terms that matched, which is how
+        # you tell a real hit from an incidental one without opening the file.
+        lines.append(f"  {(hit.get('snippet') or '').strip()}")
+        lines.append("")
+    lines.append("Open one in full with read_transcript(id='tsc-...').")
+    return "\n".join(lines)
+
+
+@tool("read_transcript",
+      "Read one past conversation, by the id search_transcripts returned. "
+      "Long conversations are paged — pass offset to continue.",
+      params={
+          "id": {"type": "string", "description": "The 'tsc-...' id from search_transcripts."},
+          "offset": {"type": "integer", "description": "First turn to return (default 0)."},
+          "limit": {"type": "integer", "description": "How many turns (default 40)."},
+      },
+      required=("id",))
+def read_transcript(id: str, offset: int = 0, limit: int = 40) -> str:
+    got = call_brain("GET", f"/api/fleet/transcripts/{id}",
+                     params={"offset": offset, "limit": limit})
+    turns = got.get("turns", [])
+    if not turns:
+        return f"No turns at offset {offset}."
+
+    out = [f"{got.get('title') or '(untitled)'} — turns {offset}–{offset + len(turns)} "
+           f"of {got.get('total', '?')}", ""]
+    for turn in turns:
+        said = []
+        for block in turn.get("blocks", []):
+            kind = block.get("kind")
+            if kind in ("text", "thinking") and block.get("text"):
+                said.append(block["text"])
+            elif kind == "tool_use":
+                said.append(f"[tool: {block.get('name')}]")
+        if said:
+            out.append(f"--- {turn.get('role')}")
+            out.append("\n".join(said))
+    if offset + len(turns) < got.get("total", 0):
+        out.append("")
+        out.append(f"… continue with read_transcript(id='{id}', offset={offset + len(turns)}).")
+    return "\n".join(out)
 
 
 # ---- JSON-RPC ---------------------------------------------------------------

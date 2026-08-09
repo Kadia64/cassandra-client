@@ -220,3 +220,349 @@ def test_status_tool_tells_the_model_when_to_call_it() -> None:
     description has to say so — nothing else will."""
     tools = {t["name"]: t for t in rpc("tools/list")["result"]["tools"]}
     assert "END" in tools["project_set_status"]["description"]
+
+
+# ---- roadmaps ---------------------------------------------------------------
+
+ROADMAP = {
+    "title": "Companion", "slug": "main", "parent": None,
+    "progress": {"done": 1, "total": 3},
+    "goals": [
+        {"id": "gol-aaa", "text": "Voice input", "state": "done", "note": "Whisper",
+         "children": []},
+        {"id": "gol-bbb", "text": "Orchestrator", "state": "todo", "note": "",
+         "children": [{"name": "tool-loop", "title": "Tool loop", "missing": False,
+                       "progress": {"done": 0, "total": 2}}]},
+    ],
+}
+
+
+def test_roadmap_read_shows_every_goal_id(brain) -> None:
+    """Every write tool takes an id, and the only place the model can get one is
+    this output — so a line without one is a dead end."""
+    brain.responses["/api/projects/companion/roadmaps"] = ROADMAP
+    out = text_of(rpc("tools/call", {"name": "roadmap_read",
+                                     "arguments": {"slug": "companion"}}))
+    assert "gol-aaa" in out and "gol-bbb" in out
+
+
+def test_roadmap_read_shows_state_and_progress(brain) -> None:
+    brain.responses["/api/projects/companion/roadmaps"] = ROADMAP
+    out = text_of(rpc("tools/call", {"name": "roadmap_read",
+                                     "arguments": {"slug": "companion"}}))
+    assert "1/3 done" in out
+    assert "[x] Voice input" in out
+    assert "[ ] Orchestrator" in out
+
+
+def test_roadmap_read_names_sub_roadmaps(brain) -> None:
+    """The name is the handle the model passes back as `roadmap`."""
+    brain.responses["/api/projects/companion/roadmaps"] = ROADMAP
+    out = text_of(rpc("tools/call", {"name": "roadmap_read",
+                                     "arguments": {"slug": "companion"}}))
+    assert "'tool-loop'" in out and "0/2 done" in out
+
+
+def test_roadmap_read_defaults_to_main(brain) -> None:
+    brain.responses["/api/projects/companion/roadmaps"] = ROADMAP
+    rpc("tools/call", {"name": "roadmap_read", "arguments": {"slug": "companion"}})
+    assert brain[-1]["path"] == "/api/projects/companion/roadmaps/main"
+
+
+def test_roadmap_read_before_there_is_one(brain) -> None:
+    """A project with no roadmap is the normal starting state, not a failure —
+    and the answer should say what to do about it."""
+    brain.responses["/api/projects/companion/roadmaps"] = RuntimeError(
+        "HTTP 404 from /api/projects/companion/roadmaps/main: unknown roadmap")
+    result = rpc("tools/call", {"name": "roadmap_read", "arguments": {"slug": "companion"}})
+    assert result["result"]["isError"] is False
+    assert "roadmap_add" in text_of(result)
+
+
+def test_a_real_roadmap_failure_still_surfaces(brain) -> None:
+    brain.responses["/api/projects/companion/roadmaps"] = RuntimeError("cannot reach brain")
+    result = rpc("tools/call", {"name": "roadmap_read", "arguments": {"slug": "companion"}})
+    assert result["result"]["isError"] is True
+
+
+def test_roadmap_add_posts_the_goal(brain) -> None:
+    brain.responses["/api/projects/companion/roadmaps"] = {
+        "id": "gol-ccc", "text": "New goal"}
+    out = text_of(rpc("tools/call", {"name": "roadmap_add",
+                                     "arguments": {"slug": "companion", "text": "New goal"}}))
+    assert brain[-1]["method"] == "POST"
+    assert brain[-1]["path"] == "/api/projects/companion/roadmaps/main/goals"
+    assert brain[-1]["body"] == {"text": "New goal"}
+    # The id comes back so the model can act on it without re-reading.
+    assert "gol-ccc" in out
+
+
+def test_roadmap_add_omits_an_empty_note(brain) -> None:
+    """A blank note would overwrite nothing, but sending it is noise the server
+    then has to decide about."""
+    brain.responses["/api/projects/companion/roadmaps"] = {"id": "gol-c", "text": "x"}
+    rpc("tools/call", {"name": "roadmap_add",
+                       "arguments": {"slug": "companion", "text": "x"}})
+    assert "note" not in brain[-1]["body"]
+
+
+def test_roadmap_set_sends_only_what_changed(brain) -> None:
+    brain.responses["/api/projects/companion/roadmaps"] = {
+        "id": "gol-aaa", "text": "Voice input", "state": "done"}
+    rpc("tools/call", {"name": "roadmap_set",
+                       "arguments": {"slug": "companion", "goal": "gol-aaa",
+                                     "state": "done"}})
+    assert brain[-1]["method"] == "PUT"
+    assert brain[-1]["path"] == "/api/projects/companion/roadmaps/main/goals/gol-aaa"
+    assert brain[-1]["body"] == {"state": "done"}
+
+
+def test_roadmap_set_reorders_through_the_same_call(brain) -> None:
+    """Reordering folds in here rather than being a fifth tool, because the
+    server already takes `index` on this endpoint."""
+    brain.responses["/api/projects/companion/roadmaps"] = {
+        "id": "gol-aaa", "text": "x", "state": "todo"}
+    rpc("tools/call", {"name": "roadmap_set",
+                       "arguments": {"slug": "companion", "goal": "gol-aaa",
+                                     "position": 0}})
+    assert brain[-1]["body"] == {"index": 0}
+
+
+def test_roadmap_set_with_nothing_to_change(brain) -> None:
+    out = text_of(rpc("tools/call", {"name": "roadmap_set",
+                                     "arguments": {"slug": "companion", "goal": "gol-aaa"}}))
+    assert "Nothing to change" in out
+    assert not brain, "an empty change must not reach the brain"
+
+
+def test_roadmap_expand_returns_the_name_to_use_next(brain) -> None:
+    """The model has to pass this name straight back as `roadmap`, so it has to
+    be in the reply rather than needing another read."""
+    brain.responses["/api/projects/companion/roadmaps"] = {
+        "slug": "tool-loop", "title": "Tool loop"}
+    out = text_of(rpc("tools/call", {
+        "name": "roadmap_expand",
+        "arguments": {"slug": "companion", "goal": "gol-bbb", "title": "Tool loop"}}))
+    assert "tool-loop" in out and "roadmap_add" in out
+
+
+def test_there_is_no_roadmap_delete_tool() -> None:
+    """Deliberate: `dropped` retires a goal and keeps it on the record. An agent
+    that can quietly erase a decision is a worse trade than a struck-through line."""
+    names = [t["name"] for t in rpc("tools/list")["result"]["tools"]]
+    assert not any("delete" in n or "remove" in n for n in names)
+
+
+def test_the_session_kickoff_carries_the_roadmap(brain) -> None:
+    """It is literally "what is next", and a session that has to be told to go
+    looking for it will not."""
+    brain.responses["/api/projects/companion/roadmaps"] = ROADMAP
+    brain.responses["/api/projects/companion"] = {"ideas": []}
+    out = text_of(rpc("tools/call", {"name": "project_recent",
+                                     "arguments": {"slug": "companion"}}))
+    assert "## roadmap" in out and "Voice input" in out
+
+
+def test_a_project_with_no_roadmap_still_has_a_kickoff(brain) -> None:
+    brain.responses["/api/projects/companion/roadmaps"] = RuntimeError("HTTP 404")
+    brain.responses["/api/projects/companion"] = {"ideas": []}
+    result = rpc("tools/call", {"name": "project_recent", "arguments": {"slug": "companion"}})
+    assert result["result"]["isError"] is False
+
+
+# ---- the idea board --------------------------------------------------------
+# `project_note` gained three optional classifiers, and two tools were added so
+# a session can read the board and move a card without leaving the editor.
+
+def test_note_without_classifiers_sends_only_the_text(brain) -> None:
+    """The fast path must stay one gesture: an unassessed idea says so by
+    omitting the fields, and the brain applies its own defaults."""
+    brain.responses["/api/projects/mygame/ideas"] = {"file": "x.md", "status": "raw"}
+    text_of(rpc("tools/call", {"name": "project_note",
+                               "arguments": {"slug": "mygame", "text": "an idea"}}))
+    assert brain[-1]["body"] == {"text": "an idea"}
+
+
+def test_note_can_file_straight_into_a_column(brain) -> None:
+    brain.responses["/api/projects/mygame/ideas"] = {"file": "x.md", "status": "quick"}
+    out = text_of(rpc("tools/call", {"name": "project_note", "arguments": {
+        "slug": "mygame", "text": "an idea", "column": "quick",
+        "priority": "high", "complexity": "small"}}))
+    assert brain[-1]["body"] == {"text": "an idea", "status": "quick",
+                                 "priority": "high", "complexity": "small"}
+    assert "quick" in out
+
+
+def test_ideas_are_grouped_by_column(brain) -> None:
+    brain.responses["/api/projects/mygame"] = {"ideas": [
+        {"file": "a.md", "title": "Alpha", "status": "raw",
+         "priority": "low", "complexity": "trivial", "pinned": False},
+        {"file": "b.md", "title": "Bravo", "status": "done",
+         "priority": "high", "complexity": "large", "pinned": True},
+    ]}
+    out = text_of(rpc("tools/call", {"name": "project_ideas",
+                                     "arguments": {"slug": "mygame"}}))
+    assert "## raw (1)" in out and "## done (1)" in out
+    assert "Alpha" in out and "Bravo" in out
+    assert "PINNED Bravo" in out
+    assert "## quick (0)" in out and "(empty)" in out
+
+
+def test_ideas_can_be_narrowed_to_one_column(brain) -> None:
+    brain.responses["/api/projects/mygame"] = {"ideas": [
+        {"file": "a.md", "title": "Alpha", "status": "raw",
+         "priority": "low", "complexity": "trivial", "pinned": False},
+        {"file": "b.md", "title": "Bravo", "status": "done",
+         "priority": "low", "complexity": "trivial", "pinned": False},
+    ]}
+    out = text_of(rpc("tools/call", {"name": "project_ideas",
+                                     "arguments": {"slug": "mygame", "column": "done"}}))
+    assert "Bravo" in out and "Alpha" not in out
+
+
+def test_idea_set_sends_only_what_changed(brain) -> None:
+    brain.responses["/api/projects/mygame/ideas/a.md"] = {
+        "title": "Alpha", "status": "done", "priority": "low",
+        "complexity": "trivial", "pinned": False}
+    out = text_of(rpc("tools/call", {"name": "project_idea_set",
+                                     "arguments": {"slug": "mygame", "file": "a.md",
+                                                   "column": "done"}}))
+    assert brain[-1]["body"] == {"status": "done"}
+    assert brain[-1]["method"] == "PUT"
+    assert "column:done" in out
+
+
+def test_idea_set_can_pin_without_moving(brain) -> None:
+    brain.responses["/api/projects/mygame/ideas/a.md"] = {
+        "title": "Alpha", "status": "raw", "priority": "low",
+        "complexity": "trivial", "pinned": True}
+    out = text_of(rpc("tools/call", {"name": "project_idea_set",
+                                     "arguments": {"slug": "mygame", "file": "a.md",
+                                                   "pinned": True}}))
+    assert brain[-1]["body"] == {"pinned": True}
+    assert "pinned" in out
+
+
+def test_idea_set_with_nothing_to_change_does_not_call_the_brain(brain) -> None:
+    before = len(brain)
+    out = text_of(rpc("tools/call", {"name": "project_idea_set",
+                                     "arguments": {"slug": "mygame", "file": "a.md"}}))
+    assert len(brain) == before, "an empty PUT would clear nothing but still write"
+    assert "Nothing to change" in out
+
+
+def test_board_vocabularies_are_declared_as_enums() -> None:
+    """A model picks from a list rather than guessing a word the brain rejects."""
+    tools = {t["name"]: t for t in rpc("tools/list")["result"]["tools"]}
+    assert tools["project_note"]["inputSchema"]["properties"]["column"]["enum"] == [
+        "raw", "quick", "big", "done"]
+    assert tools["project_idea_set"]["inputSchema"]["properties"]["priority"]["enum"] == [
+        "high", "normal", "low"]
+
+
+# ---- the transcript corpus --------------------------------------------------
+# Not project-scoped, unlike everything above: most of a claude.ai history
+# belongs to no project, and these tools are the only way to reach any of it.
+
+HITS = {
+    "query": "sand",
+    "count": 2,
+    "results": [
+        {"id": "tsc-aaa", "source": "claude_web", "title": "Falling sand",
+         "project_slug": None, "started_at": "2025-06-08T10:00:00Z",
+         "received_at": "2026-08-09T04:00:00Z",
+         "snippet": "trying to make a «sand» simulation"},
+        {"id": "tsc-bbb", "source": "claude_code", "title": "chunk loading",
+         "project_slug": "game-engine", "started_at": "2026-04-07T09:00:00Z",
+         "received_at": "2026-08-09T04:00:00Z",
+         "snippet": "«sand» falls between chunks"},
+    ],
+}
+
+
+def test_search_returns_an_id_for_every_hit(brain) -> None:
+    """read_transcript takes an id and the only place to get one is this
+    output, so a result without one is a dead end."""
+    brain.responses["/api/transcripts/search"] = HITS
+    out = text_of(rpc("tools/call", {"name": "search_transcripts",
+                                     "arguments": {"query": "sand"}}))
+    assert "tsc-aaa" in out and "tsc-bbb" in out
+    assert "read_transcript" in out
+
+
+def test_search_names_the_source_and_where_it_was_filed(brain) -> None:
+    brain.responses["/api/transcripts/search"] = HITS
+    out = text_of(rpc("tools/call", {"name": "search_transcripts",
+                                     "arguments": {"query": "sand"}}))
+    assert "claude_web" in out and "claude_code" in out
+    # An unrouted conversation says so rather than showing a blank column.
+    assert "unfiled" in out and "game-engine" in out
+
+
+def test_search_dates_by_when_the_conversation_happened(brain) -> None:
+    # Not received_at: an imported archive lands in one second, so showing that
+    # would date fourteen months of history to import day.
+    brain.responses["/api/transcripts/search"] = HITS
+    out = text_of(rpc("tools/call", {"name": "search_transcripts",
+                                     "arguments": {"query": "sand"}}))
+    assert "2025-06-08" in out
+    assert "2026-08-09" not in out
+
+
+def test_search_passes_filters_through_and_omits_empty_ones(brain) -> None:
+    brain.responses["/api/transcripts/search"] = HITS
+    rpc("tools/call", {"name": "search_transcripts",
+                       "arguments": {"query": "sand", "source": "claude_web",
+                                     "limit": 5}})
+    params = brain[-1]["params"]
+    assert params["q"] == "sand" and params["source"] == "claude_web"
+    # A blank project must not become `project=`, which the brain would treat
+    # as a real filter and match nothing.
+    assert "project" not in params and "since" not in params
+
+
+def test_search_says_so_plainly_when_nothing_matches(brain) -> None:
+    brain.responses["/api/transcripts/search"] = {"query": "zzz", "count": 0,
+                                                  "results": []}
+    out = text_of(rpc("tools/call", {"name": "search_transcripts",
+                                     "arguments": {"query": "zzz"}}))
+    assert "No conversation" in out
+
+
+TURNS = {
+    "title": "Falling sand", "total": 90,
+    "turns": [
+        {"role": "user", "blocks": [{"kind": "text", "text": "how do I make sand fall"}]},
+        {"role": "assistant", "blocks": [
+            {"kind": "thinking", "text": "cellular automaton"},
+            {"kind": "text", "text": "Swap the cell below."},
+            {"kind": "tool_use", "name": "repl"},
+        ]},
+    ],
+}
+
+
+def test_read_transcript_renders_turns_and_names_tools(brain) -> None:
+    brain.responses["/api/fleet/transcripts/"] = TURNS
+    out = text_of(rpc("tools/call", {"name": "read_transcript",
+                                     "arguments": {"id": "tsc-aaa"}}))
+    assert "how do I make sand fall" in out
+    assert "Swap the cell below." in out
+    # The tool call is named but not expanded — its output is not the point.
+    assert "[tool: repl]" in out
+
+
+def test_read_transcript_offers_the_next_page(brain) -> None:
+    """A conversation longer than the window has to say how to continue, or the
+    model reads the first 40 turns and assumes that is all of it."""
+    brain.responses["/api/fleet/transcripts/"] = TURNS
+    out = text_of(rpc("tools/call", {"name": "read_transcript",
+                                     "arguments": {"id": "tsc-aaa"}}))
+    assert "offset=2" in out
+
+
+def test_read_transcript_stops_offering_at_the_end(brain) -> None:
+    brain.responses["/api/fleet/transcripts/"] = {**TURNS, "total": 2}
+    out = text_of(rpc("tools/call", {"name": "read_transcript",
+                                     "arguments": {"id": "tsc-aaa"}}))
+    assert "offset=" not in out

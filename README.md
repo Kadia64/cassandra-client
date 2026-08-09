@@ -123,10 +123,31 @@ Nothing else to configure — it reuses this machine's fleet credentials.
 | `project_recent` | what was last worked on and what is next |
 | `project_files` | what is in the project |
 | `project_read` | one file from it |
-| `project_note` | capture an idea against it |
+| `project_note` | capture an idea against it, optionally straight into a column |
+| `project_ideas` | the idea board, grouped by column |
+| `project_idea_set` | move a card, or change its priority, complexity or pin |
+| `project_set_status` | write the handoff at the end of a session |
+| `roadmap_read` | the project's goals, what is done, what is broken out |
+| `roadmap_add` | add a goal, to `main` or to a sub-roadmap |
+| `roadmap_set` | check off, backtrack, reword, reorder |
+| `roadmap_expand` | turn a goal into a sub-roadmap of its own |
+| `search_transcripts` | search every past conversation — Claude Code on any machine, and claude.ai history |
+| `read_transcript` | open one of them in full |
 
-**Context, not development.** Reading a project and firing an idea at it — the
-session itself is for the actual work.
+**Context and planning, not development.** Reading a project, keeping its
+roadmap honest, and firing an idea at it — the session itself is for the actual
+work.
+
+The idea board's four columns are `raw` (unsorted), `quick` (small and obvious),
+`big` (needs expanding) and `done`. `project_note` takes them, plus `priority`
+and `complexity`, but **all three are optional and should usually be omitted**:
+an idea nobody has assessed belongs in `raw` at the bottom of both scales, and a
+capture that stops to classify is a capture you stop reaching for.
+
+Roadmaps have **no delete tool**, deliberately. `roadmap_set(state="dropped")`
+retires a goal and leaves it struck through; erasing one is a panel action. An
+agent that can quietly remove the record of a decision is a worse trade than one
+that leaves a line behind.
 
 Adding a tool is one decorated function in `cassandra_mcp.py`; the schema is
 declared beside the implementation and the JSON the model sees is generated
