@@ -278,7 +278,10 @@ def project_note(slug: str, text: str, column: str = "", priority: str = "",
     result = call_brain("POST", f"/api/projects/{slug}/ideas", body)
     where = result.get("status", "raw")
     tagged = f", module: {result['module']}" if result.get("module") else ""
-    return f"Saved to {slug} as {result['file']} (column: {where}{tagged})."
+    # Report the id, so the answer can quote back the same handle the board
+    # shows and project_idea takes.
+    return (f"Saved to {slug} as {result.get('id') or result['file']} "
+            f"(column: {where}{tagged}).")
 
 
 @tool("project_ideas",
@@ -297,11 +300,43 @@ def project_ideas(slug: str, column: str = "") -> str:
         out.append(f"## {name} ({len(rows)})")
         for i in rows:
             pin = "PINNED " if i.get("pinned") else ""
+            # The id, not the filename. It is the handle the user copies out of
+            # the board and pastes into a session, it is shorter than a dated
+            # six-word slug, and every tool here takes either — so printing the
+            # one they will actually quote keeps both ends speaking the same
+            # language.
             out.append(f"- {pin}{i['title']}  [{i.get('priority')}/{i.get('complexity')}]"
-                       f"  {i['file']}")
+                       f"  {i.get('id') or i['file']}")
         if not rows:
             out.append("- (empty)")
     return "\n".join(out)
+
+
+@tool("project_idea",
+      "One idea in full, by the id the board shows (ide-…). Use this when the "
+      "user quotes an id at you — project_ideas lists titles only, and the "
+      "detail you need is in the body.",
+      params={"slug": SLUG,
+              "id": {"type": "string",
+                     "description": "The idea's id (ide-…) or filename, from "
+                                    "project_ideas."}},
+      required=("slug", "id"))
+def project_idea(slug: str, id: str) -> str:
+    ideas = call_brain("GET", f"/api/projects/{slug}").get("ideas", [])
+    wanted = id.strip()
+    for i in ideas:
+        if wanted in (i.get("id"), i.get("file")):
+            head = (f"{i['title']}\n"
+                    f"id: {i.get('id')}   file: {i['file']}\n"
+                    f"column: {i.get('status')}   priority: {i.get('priority')}   "
+                    f"complexity: {i.get('complexity')}\n"
+                    f"captured: {i.get('captured')}\n")
+            # The whole file, frontmatter included: it is a few hundred bytes,
+            # and stripping it here would mean re-deriving fields the header
+            # above already states.
+            return f"{head}\n{i.get('text', '')}"
+    return (f"{slug} has no idea {wanted!r}. Call project_ideas for the board — "
+            f"ids are shown beside each title.")
 
 
 @tool("project_idea_set",
@@ -309,7 +344,8 @@ def project_ideas(slug: str, column: str = "") -> str:
       "Only the fields you pass are changed.",
       params={"slug": SLUG,
               "file": {"type": "string",
-                       "description": "The idea's filename, from project_ideas."},
+                       "description": "The idea's id (ide-…) or filename, from "
+                                      "project_ideas."},
               "column": COLUMN,
               "priority": {"type": "string", "enum": list(PRIORITIES),
                            "description": "How much it matters."},
@@ -492,6 +528,17 @@ def roadmap_expand(slug: str, goal: str, roadmap: str = "main", title: str = "")
 # git can carry them between machines.
 
 
+def _git_remote() -> str:
+    """This repo's origin URL, or "" if there is no git or no remote."""
+    import subprocess
+    try:
+        done = subprocess.run(["git", "remote", "get-url", "origin"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
 def _write_scaffold(scaffold: dict[str, str]) -> list[str]:
     """Write `{relative path: contents}` under the cwd. Never overwrites.
 
@@ -521,16 +568,31 @@ def _write_scaffold(scaffold: dict[str, str]) -> list[str]:
                                   "The slug is derived from it; the folder and "
                                   "GitHub names do not have to match."},
           "description": {"type": "string", "description": "One or two sentences."},
+          "repo": {"type": "string",
+                   "description": "The git remote, if there is one — e.g. "
+                                  "https://github.com/you/thing.git. Recorded so "
+                                  "project_context can say where the code lives."},
       },
       required=("name",))
-def project_new(name: str, description: str = "") -> str:
+def project_new(name: str, description: str = "", repo: str = "") -> str:
     cfg = load_config()
-    project = call_brain("POST", "/api/projects", {
+    machine_id = cfg.get("machine_id", "")
+    body: dict[str, Any] = {
         "name": name, "description": description,
-        "machine_id": cfg.get("machine_id", ""), "cwd": str(Path.cwd()),
-    })
+        "machine_id": machine_id, "cwd": str(Path.cwd()),
+    }
+    if not repo:
+        # Ask git rather than the user: the remote is already configured in the
+        # repo you are standing in, and a link retyped by hand is a link that
+        # can be wrong.
+        repo = _git_remote()
+    if repo:
+        body["code"] = {"kind": "git", "url": repo, "machine_id": machine_id}
+    project = call_brain("POST", "/api/projects", body)
     written = _write_scaffold(project.get("scaffold") or {})
+    code = (project.get("code") or {})
     lines = [f"Created project '{project['slug']}' ({project['name']}).",
+             *([f"Code: {code['url']}"] if code.get("url") else []),
              f"Linked {cfg.get('machine_id', '?')}:{Path.cwd()} — transcripts "
              f"from here now file themselves, including ones already uploaded."]
     if written:
@@ -540,6 +602,32 @@ def project_new(name: str, description: str = "") -> str:
         lines.append("Left alone (already present): " + ", ".join(skipped))
     lines.append("Commit these — .claude/cassandra.json is what identifies this "
                  "repo, so cloning it elsewhere needs no further setup.")
+    return "\n".join(lines)
+
+
+@tool("project_link",
+      "Connect the repository you are in to a project Cassandra ALREADY knows "
+      "about — use this instead of project_new when the project exists, which "
+      "it does for anything being migrated or cloned onto another machine. "
+      "Writes .claude/cassandra.json and .mcp.json, and registers this machine "
+      "and directory so its transcripts file themselves. Run from the repo root.",
+      params={"slug": SLUG}, required=("slug",))
+def project_link(slug: str) -> str:
+    cfg = load_config()
+    project = call_brain("POST", f"/api/projects/{slug}/link", {
+        "machine_id": cfg.get("machine_id", ""), "cwd": str(Path.cwd()),
+    })
+    written = _write_scaffold(project.get("scaffold") or {})
+    lines = [f"Linked this repo to '{project['slug']}' ({project['name']}).",
+             f"{cfg.get('machine_id', '?')}:{Path.cwd()} is now a transcript "
+             f"source — anything already uploaded from here has been re-filed."]
+    if written:
+        lines.append("Wrote: " + ", ".join(written))
+    skipped = sorted(set(project.get("scaffold") or {}) - set(written))
+    if skipped:
+        lines.append("Left alone (already present): " + ", ".join(skipped))
+    lines.append("Commit .claude/cassandra.json — it is what identifies this "
+                 "repo, so other clones of it need no setup at all.")
     return "\n".join(lines)
 
 
@@ -580,6 +668,120 @@ def module_list(slug: str) -> str:
             detail += f" — {m['description']}"
         lines.append(f"{m['slug']:<22} {detail}")
     return "\n".join(lines)
+
+
+# ---- work in flight ---------------------------------------------------------
+# One feature = one branch = one worktree = one session, several at once across
+# two machines. Cassandra is the only shared, live store: git holds the code,
+# and tracked markdown written by N parallel branches conflicts at merge time.
+# Everything about in-flight state belongs here rather than in `.claude/`.
+#
+# `slug` is the primary key throughout — worktree directory name == branch slug
+# == work slug. `/land` and `/try` already depend on that on the git side.
+
+WORK_SLUG = {"type": "string",
+             "description": "The worktree/branch slug, e.g. 'biome-tuning'."}
+
+
+def _work_line(w: dict[str, Any]) -> str:
+    bits = [f"{w['slug']:<20} {w.get('branch', ''):<28} {w.get('machine', '')}"]
+    if w.get("module"):
+        bits.append(f"module:{w['module']}")
+    if w.get("state") == "landed":
+        bits.append(f"landed {(w.get('landed_at') or '')[:10]}")
+    return "  ".join(bits)
+
+
+@tool("work_start",
+      "Register a unit of work when a feature branch and worktree are created. "
+      "Idempotent — call it on resume as well as on create.",
+      params={"project": SLUG, "slug": WORK_SLUG,
+              "branch": {"type": "string",
+                         "description": "Full branch name, e.g. feature/biome-tuning."},
+              "machine": {"type": "string",
+                          "description": "Which dev machine. Omit to use this one."},
+              "goal": {"type": "string",
+                       "description": "Goal id from roadmap_read, e.g. gol-1e0f953bd454."},
+              "module": {"type": "string", "description": "From module_list."},
+              "roadmap": {"type": "string",
+                          "description": "Sub-roadmap holding this branch's steps."}},
+      required=("project", "slug", "branch"))
+def work_start(project: str, slug: str, branch: str, machine: str = "",
+               goal: str = "", module: str = "", roadmap: str = "") -> str:
+    # Recorded, never inferred: worktrees do not cross machines but branches do,
+    # and the one real hazard in this workflow is the same branch active on two
+    # machines at once. Defaulting to *this* machine is the honest default.
+    machine = machine or load_config().get("machine_id", "")
+    record = call_brain("POST", f"/api/projects/{project}/work", {
+        "slug": slug, "branch": branch, "machine": machine,
+        "goal": goal, "module": module, "roadmap": roadmap})
+    lines = [f"Work '{record['slug']}' registered on {project}: "
+             f"{record['branch']} @ {record['machine']}."]
+    if record.get("warning"):
+        lines.append(f"Warning: {record['warning']} — two branches in one "
+                     f"module collide in code and in .claude/modules/.")
+    return "\n".join(lines)
+
+
+@tool("work_list",
+      "What is currently in flight — which branches are being worked on, on "
+      "which machines. Call this with no arguments to answer 'what was I doing?' "
+      "after time away.",
+      params={"project": {"type": "string",
+                          "description": "One project's slug. Omit for all."},
+              "machine": {"type": "string", "description": "Filter to one machine."},
+              "state": {"type": "string", "enum": ["active", "landed", "all"],
+                        "description": "Default active. 'landed' reads as a changelog."}})
+def work_list(project: str = "", machine: str = "", state: str = "active") -> str:
+    params: dict[str, Any] = {"state": state or "active"}
+    if project:
+        params["project"] = project
+    if machine:
+        params["machine"] = machine
+    found = call_brain("GET", "/api/work", params=params).get("work", [])
+    if not found:
+        return f"Nothing {state or 'active'}."
+    return "\n".join(_work_line(w) for w in found)
+
+
+@tool("work_get",
+      "Everything needed to brief a session on one branch: the goal it serves "
+      "and the steps still outstanding. This is the call /feature makes.",
+      params={"project": SLUG, "slug": WORK_SLUG},
+      required=("project", "slug"))
+def work_get(project: str, slug: str) -> str:
+    w = call_brain("GET", f"/api/projects/{project}/work/{slug}")
+    out = [f"# {w['slug']} — {w.get('branch', '')} on {w.get('machine', '')}",
+           f"state: {w.get('state', 'active')}"]
+    if w.get("module"):
+        out.append(f"module: {w['module']}")
+    if w.get("goal_text"):
+        out.append(f"\n## Goal ({w.get('goal')})\n{w['goal_text']}"
+                   + (f"\nnote: {w['goal_note']}" if w.get("goal_note") else ""))
+    remaining = w.get("remaining") or []
+    if remaining:
+        out.append("\n## Remaining steps")
+        out += [f"- [ ] {s['text']}   {s['id']}" for s in remaining]
+    elif w.get("steps"):
+        out.append("\nAll steps are done.")
+    return "\n".join(out)
+
+
+@tool("work_finish",
+      "Called after a branch is merged. Marks the work landed — it is not "
+      "deleted, because landed work is the project history. Marking the "
+      "roadmap steps done is a separate roadmap_set call, so a branch can land "
+      "without claiming its goal is finished.",
+      params={"project": SLUG, "slug": WORK_SLUG,
+              "commit": {"type": "string", "description": "The merge commit on main."},
+              "note": {"type": "string", "description": "One line on what landed."}},
+      required=("project", "slug"))
+def work_finish(project: str, slug: str, commit: str = "", note: str = "") -> str:
+    w = call_brain("POST", f"/api/projects/{project}/work/{slug}/finish",
+                   {"commit": commit, "note": note})
+    return (f"'{w['slug']}' landed"
+            + (f" as {w['commit'][:8]}" if w.get("commit") else "")
+            + ". Its roadmap steps are unchanged — use roadmap_set for those.")
 
 
 # ---- the transcript corpus --------------------------------------------------

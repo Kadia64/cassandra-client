@@ -652,3 +652,162 @@ def test_project_note_omits_an_empty_module(brain) -> None:
     rpc("tools/call", {"name": "project_note",
                        "arguments": {"slug": "demo", "text": "sand"}})
     assert "module" not in brain[-1]["body"]
+
+
+def test_project_new_records_the_git_remote(brain, in_repo, monkeypatch) -> None:
+    """Asked of git rather than the user: the remote is already configured in
+    the repo you are standing in, and a retyped link can be wrong."""
+    monkeypatch.setattr(mcp, "_git_remote", lambda: "https://github.com/you/thing.git")
+    brain.responses["/api/projects"] = {
+        "slug": "thing", "name": "Thing", "scaffold": {},
+        "code": {"kind": "git", "url": "https://github.com/you/thing.git"}}
+    out = text_of(rpc("tools/call", {"name": "project_new",
+                                     "arguments": {"name": "Thing"}}))
+    assert brain[-1]["body"]["code"]["url"] == "https://github.com/you/thing.git"
+    assert "github.com/you/thing.git" in out
+
+
+def test_an_explicit_repo_beats_what_git_reports(brain, in_repo, monkeypatch) -> None:
+    monkeypatch.setattr(mcp, "_git_remote", lambda: "https://github.com/you/wrong.git")
+    brain.responses["/api/projects"] = {"slug": "t", "name": "T", "scaffold": {}}
+    rpc("tools/call", {"name": "project_new",
+                       "arguments": {"name": "T", "repo": "https://github.com/you/right.git"}})
+    assert brain[-1]["body"]["code"]["url"] == "https://github.com/you/right.git"
+
+
+def test_no_remote_is_not_an_error(brain, in_repo, monkeypatch) -> None:
+    # A project with no repo yet is legitimate — code.kind stays "none".
+    monkeypatch.setattr(mcp, "_git_remote", lambda: "")
+    brain.responses["/api/projects"] = {"slug": "t", "name": "T", "scaffold": {}}
+    rpc("tools/call", {"name": "project_new", "arguments": {"name": "T"}})
+    assert "code" not in brain[-1]["body"]
+
+
+# ---- ideas by id -----------------------------------------------------------
+
+def test_ideas_are_listed_by_id_not_filename(brain) -> None:
+    brain.responses["/api/projects/mygame"] = {"ideas": [
+        {"file": "2026-08-11-a-long-dated-slug.md", "id": "ide-45ba3e2aae98",
+         "title": "Alpha", "status": "raw", "priority": "low",
+         "complexity": "trivial", "pinned": False},
+    ]}
+    out = text_of(rpc("tools/call", {"name": "project_ideas",
+                                     "arguments": {"slug": "mygame"}}))
+    assert "ide-45ba3e2aae98" in out
+    assert "2026-08-11-a-long-dated-slug.md" not in out
+
+
+def test_ideas_fall_back_to_the_filename_when_a_brain_sends_no_id(brain) -> None:
+    """An older brain still lists something usable rather than `None`."""
+    brain.responses["/api/projects/mygame"] = {"ideas": [
+        {"file": "a.md", "title": "Alpha", "status": "raw",
+         "priority": "low", "complexity": "trivial", "pinned": False},
+    ]}
+    out = text_of(rpc("tools/call", {"name": "project_ideas",
+                                     "arguments": {"slug": "mygame"}}))
+    assert "a.md" in out and "None" not in out
+
+
+def test_project_idea_returns_the_body_for_an_id(brain) -> None:
+    brain.responses["/api/projects/mygame"] = {"ideas": [
+        {"file": "a.md", "id": "ide-45ba3e2aae98", "title": "Alpha",
+         "status": "quick", "priority": "high", "complexity": "trivial",
+         "captured": "2026-08-11T09:45:25Z",
+         "text": "---\nid: ide-45ba3e2aae98\n---\n\nthe whole thought"},
+    ]}
+    out = text_of(rpc("tools/call", {"name": "project_idea",
+                                     "arguments": {"slug": "mygame",
+                                                   "id": "ide-45ba3e2aae98"}}))
+    assert "Alpha" in out
+    assert "the whole thought" in out
+    assert "column: quick" in out
+
+
+def test_project_idea_also_takes_a_filename(brain) -> None:
+    brain.responses["/api/projects/mygame"] = {"ideas": [
+        {"file": "a.md", "id": "ide-45ba3e2aae98", "title": "Alpha",
+         "status": "raw", "text": "body"},
+    ]}
+    out = text_of(rpc("tools/call", {"name": "project_idea",
+                                     "arguments": {"slug": "mygame", "id": "a.md"}}))
+    assert "Alpha" in out
+
+
+def test_project_idea_says_so_when_the_id_is_unknown(brain) -> None:
+    brain.responses["/api/projects/mygame"] = {"ideas": []}
+    out = text_of(rpc("tools/call", {"name": "project_idea",
+                                     "arguments": {"slug": "mygame",
+                                                   "id": "ide-000000000000"}}))
+    assert "no idea" in out and "project_ideas" in out
+
+
+# ---- linking an existing project -------------------------------------------
+# The migration case, and the second-machine case. Running project_new for a
+# project that already exists is how you end up with two, one holding all the
+# history.
+
+def test_project_link_scaffolds_without_creating(brain, in_repo) -> None:
+    brain.responses["/api/projects/frontier/link"] = {
+        "slug": "frontier", "name": "Project Frontier",
+        "scaffold": {".claude/cassandra.json": '{"id": "prj-old"}\n'}}
+    out = text_of(rpc("tools/call", {"name": "project_link",
+                                     "arguments": {"slug": "frontier"}}))
+    assert (in_repo / ".claude/cassandra.json").read_text() == '{"id": "prj-old"}\n'
+    # It must not hit the create endpoint at all.
+    assert all(c["path"] != "/api/projects" or c["method"] != "POST" for c in brain)
+    assert "frontier" in out
+
+
+def test_project_link_sends_this_machine_and_directory(brain, in_repo) -> None:
+    brain.responses["/api/projects/frontier/link"] = {
+        "slug": "frontier", "name": "F", "scaffold": {}}
+    rpc("tools/call", {"name": "project_link", "arguments": {"slug": "frontier"}})
+    assert brain[-1]["body"]["cwd"] == str(in_repo)
+
+
+# ---- work in flight ---------------------------------------------------------
+
+def test_work_start_defaults_to_this_machine(brain, monkeypatch) -> None:
+    """Recorded, never inferred by the server: the workflow's one real hazard is
+    the same branch active on two machines, and only the caller knows which."""
+    monkeypatch.setattr(mcp, "load_config", lambda: {"server": "x", "machine_id": "bazzite"})
+    brain.responses["/api/projects/f/work"] = {
+        "slug": "b", "branch": "feature/b", "machine": "bazzite"}
+    rpc("tools/call", {"name": "work_start",
+                       "arguments": {"project": "f", "slug": "b", "branch": "feature/b"}})
+    assert brain[-1]["body"]["machine"] == "bazzite"
+
+
+def test_work_start_surfaces_the_module_clash_warning(brain) -> None:
+    brain.responses["/api/projects/f/work"] = {
+        "slug": "b", "branch": "feature/b", "machine": "bazzite",
+        "warning": "cave-shapes is already active in module 'world-generation'"}
+    out = text_of(rpc("tools/call", {"name": "work_start",
+                                     "arguments": {"project": "f", "slug": "b",
+                                                   "branch": "feature/b"}}))
+    assert "cave-shapes" in out and "Warning" in out
+
+
+def test_work_get_inlines_the_goal_and_remaining_steps(brain) -> None:
+    # The point of the tool: one call to brief a session, not four.
+    brain.responses["/api/projects/f/work/b"] = {
+        "slug": "b", "branch": "feature/b", "machine": "bazzite", "state": "active",
+        "goal": "gol-123", "goal_text": "Biomes feel distinct",
+        "remaining": [{"id": "gol-a", "text": "Temperature map", "state": "todo"}]}
+    out = text_of(rpc("tools/call", {"name": "work_get",
+                                     "arguments": {"project": "f", "slug": "b"}}))
+    assert "Biomes feel distinct" in out and "Temperature map" in out
+
+
+def test_work_list_says_so_when_nothing_is_in_flight(brain) -> None:
+    brain.responses["/api/work"] = {"work": []}
+    assert "Nothing" in text_of(rpc("tools/call", {"name": "work_list", "arguments": {}}))
+
+
+def test_work_finish_does_not_claim_the_goal_is_done(brain) -> None:
+    """A branch can land without its goal being finished — marking steps done
+    stays a separate roadmap_set call."""
+    brain.responses["/api/projects/f/work/b/finish"] = {"slug": "b", "commit": "abc12345"}
+    out = text_of(rpc("tools/call", {"name": "work_finish",
+                                     "arguments": {"project": "f", "slug": "b"}}))
+    assert "roadmap_set" in out
